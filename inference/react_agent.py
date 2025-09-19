@@ -4,7 +4,8 @@ import os
 from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 from qwen_agent.llm.schema import Message
 from qwen_agent.utils.utils import build_text_completion_prompt
-from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
+import lmstudio
+from lmstudio import LMStudioError
 import tiktoken
 from transformers import AutoTokenizer 
 from datetime import datetime
@@ -53,11 +54,93 @@ class MultiTurnReactAgent(FnCallAgent):
 
         self.llm_generate_cfg = llm["generate_cfg"]
         self.llm_local_path = llm["model"]
+        
+        # Initialize LMStudio client
+        try:
+            # Check if there's a specific API host in the config
+            api_host = llm.get("api_host") or llm.get("base_url")
+            if api_host:
+                self.lmstudio_client = lmstudio.Client(api_host=api_host)
+            else:
+                self.lmstudio_client = lmstudio.Client()
+        except Exception as ex:
+            print(f"Warning: Failed to initialize LMStudio client: {ex}")
+            self.lmstudio_client = None
 
     def sanity_check_output(self, content):
         return "<think>" in content and "</think>" in content
     
     def call_server(self, msgs, planning_port, max_tries=10):
+        """
+        Call LMStudio server using the LMStudio SDK.
+        Falls back to OpenAI-compatible API if LMStudio client is not available.
+        """
+        
+        # Try LMStudio SDK first
+        if self.lmstudio_client is not None:
+            return self._call_lmstudio_server(msgs, max_tries)
+        else:
+            # Fallback to OpenAI-compatible API
+            return self._call_openai_compatible_server(msgs, planning_port, max_tries)
+    
+    def _call_lmstudio_server(self, msgs, max_tries=10):
+        """Call LMStudio server using native SDK."""
+        base_sleep_time = 1
+        
+        for attempt in range(max_tries):
+            try:
+                print(f"--- Attempting to call LMStudio service, try {attempt + 1}/{max_tries} ---")
+                
+                # Get LLM instance
+                llm = lmstudio.llm(self.model)
+                
+                # Convert messages to LMStudio format
+                history = []
+                for msg in msgs:
+                    history.append({
+                        "role": msg["role"],
+                        "content": msg["content"]
+                    })
+                
+                # Prepare prediction config
+                config = {
+                    "temperature": self.llm_generate_cfg.get('temperature', 0.6),
+                    "top_p": self.llm_generate_cfg.get('top_p', 0.95),
+                    "max_tokens": 10000,
+                    "stop": ["\n<tool_response>", "<tool_response>"]
+                }
+                
+                if 'presence_penalty' in self.llm_generate_cfg:
+                    config['presence_penalty'] = self.llm_generate_cfg['presence_penalty']
+                
+                # Call LMStudio
+                result = llm.respond(history=history, config=config)
+                content = result.content if hasattr(result, 'content') else str(result)
+                
+                if content and content.strip():
+                    print("--- LMStudio service call successful, received a valid response ---")
+                    return content.strip()
+                else:
+                    print(f"Warning: Attempt {attempt + 1} received an empty response.")
+
+            except LMStudioError as e:
+                print(f"Error: Attempt {attempt + 1} failed with LMStudio error: {e}")
+            except Exception as e:
+                print(f"Error: Attempt {attempt + 1} failed with an unexpected error: {e}")
+
+            if attempt < max_tries - 1:
+                sleep_time = base_sleep_time * (2 ** attempt) + random.uniform(0, 1)
+                sleep_time = min(sleep_time, 30)
+                print(f"Retrying in {sleep_time:.2f} seconds...")
+                time.sleep(sleep_time)
+            else:
+                print("Error: All retry attempts have been exhausted. The call has failed.")
+        
+        return "LMStudio server error!!!"
+    
+    def _call_openai_compatible_server(self, msgs, planning_port, max_tries=10):
+        """Fallback method using OpenAI-compatible API."""
+        from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
         
         openai_api_key = "EMPTY"
         openai_api_base = f"http://127.0.0.1:{planning_port}/v1"
